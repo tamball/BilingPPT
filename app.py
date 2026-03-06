@@ -6,8 +6,8 @@ from docx import Document
 from deep_translator import GoogleTranslator
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
-from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
+from pptx.util import Inches, Pt, Emu
 
 # ── Language options ──────────────────────────────────────────────────────────
 
@@ -99,7 +99,31 @@ def max_chars_for_font(font_pt: int, lang_code: str = "en") -> int:
     usable_w   = (13.33 - 0.9) * 72
     factor     = _char_width_factor(lang_code)
     chars_line = int(usable_w / (font_pt * factor))
-    return max(10, int(lines * chars_line * 0.85))
+    return max(10, int(lines * chars_line * 0.75))
+
+
+def _src_max_chars(font_pt: int, src_code: str, tgt_code: str) -> int:
+    """
+    Max source-text characters per slide, accounting for cross-script expansion
+    so that the *translated* text also fits in its half of the slide.
+
+    CJK → Latin translations expand ~2.5×; Latin → CJK compress to ~0.4×.
+    Using the inverse expansion as a divisor keeps translated text in-bounds.
+    """
+    src_max = max_chars_for_font(font_pt, src_code)
+    tgt_max = max_chars_for_font(font_pt, tgt_code)
+
+    src_is_cjk = src_code in CJK_LANG_CODES
+    tgt_is_cjk = tgt_code in CJK_LANG_CODES
+
+    if src_is_cjk and not tgt_is_cjk:
+        # e.g. Chinese → English: translation is ~2.5× longer in characters
+        src_max = min(src_max, int(tgt_max / 2.5))
+    elif not src_is_cjk and tgt_is_cjk:
+        # e.g. English → Chinese: translation is compressed; keep as-is
+        pass
+
+    return min(src_max, tgt_max)
 
 
 def _split_to_fit(text: str, max_chars: int) -> list[str]:
@@ -275,6 +299,14 @@ def _add_textbox(slide, left, top, width, height, text, color, font_pt, bold=Fal
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
     tf.word_wrap = True
+    # Remove default internal padding so every pixel of the box is usable
+    tf.margin_top    = Emu(0)
+    tf.margin_bottom = Emu(0)
+    tf.margin_left   = Emu(0)
+    tf.margin_right  = Emu(0)
+    # Safety net: if text still overflows, PowerPoint shrinks the font to fit
+    # rather than letting it bleed into the adjacent language box
+    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     for idx, line in enumerate(text.split("\n")):
         p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
         p.alignment = align
@@ -435,11 +467,8 @@ if uploaded_file:
         mode_key  = "paragraph" if split_mode == "Paragraphs" else "sentence"
         src_code  = LANGUAGES[src_lang]
         tgt_code  = LANGUAGES[tgt_lang]
-        # Use the stricter (smaller) limit so both languages fit without overflow
-        max_chars = min(
-            max_chars_for_font(font_size, src_code),
-            max_chars_for_font(font_size, tgt_code),
-        )
+        # Use cross-script-aware limit: accounts for CJK→Latin expansion (~2.5×)
+        max_chars = _src_max_chars(font_size, src_code, tgt_code)
         chunks = build_chunks(paragraphs, mode_key, sentences_per_slide, max_chars)
         chunks = fix_orphan_chunks(chunks, max_chars)
         st.info(f"{len(chunks)} slide(s) will be created.")
