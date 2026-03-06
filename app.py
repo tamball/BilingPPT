@@ -69,6 +69,14 @@ THEMES = {
 
 # ── Text processing ───────────────────────────────────────────────────────────
 
+# Languages whose scripts are full-width (each glyph ≈ 1 em wide).
+# Latin scripts average ~0.55 em per character.
+CJK_LANG_CODES = {"zh-CN", "zh-TW", "ja", "ko"}
+
+def _char_width_factor(lang_code: str) -> float:
+    """Return estimated average character width as a fraction of font size (em)."""
+    return 1.0 if lang_code in CJK_LANG_CODES else 0.55
+
 def extract_paragraphs(docx_file) -> list[str]:
     """Return non-empty paragraph strings from a .docx file."""
     doc = Document(docx_file)
@@ -81,37 +89,44 @@ def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in parts if s.strip()]
 
 
-def max_chars_for_font(font_pt: int) -> int:
+def max_chars_for_font(font_pt: int, lang_code: str = "en") -> int:
     """
-    Estimate the maximum characters that safely fit in one text box half
-    (half the slide height at 16:9, with 0.2" top/bottom padding).
-    Uses a 0.85 safety factor to allow more text per slide while still
-    leaving headroom for translated text being slightly longer.
+    Estimate the maximum characters that safely fit in one text box half,
+    accounting for CJK full-width glyphs vs narrow Latin glyphs.
     """
-    BOX_H_PT   = (7.5 - 0.4) / 2 * 72          # ~248 pt per half
+    BOX_H_PT   = (7.5 - 0.4) / 2 * 72
     lines      = int(BOX_H_PT / (font_pt * 1.2))
-    usable_w   = (13.33 - 0.9) * 72             # ~895 pt
-    chars_line = int(usable_w / (font_pt * 0.55))
-    return max(20, int(lines * chars_line * 0.85))
+    usable_w   = (13.33 - 0.9) * 72
+    factor     = _char_width_factor(lang_code)
+    chars_line = int(usable_w / (font_pt * factor))
+    return max(10, int(lines * chars_line * 0.85))
 
 
 def _split_to_fit(text: str, max_chars: int) -> list[str]:
-    """Break text into pieces no longer than max_chars at word boundaries."""
+    """
+    Break text into pieces ≤ max_chars.
+    For space-delimited text (Latin etc.) splits at word boundaries.
+    For CJK and other no-space scripts, falls back to character boundaries.
+    """
     if len(text) <= max_chars:
         return [text]
     words = text.split()
-    pieces, current = [], ""
-    for word in words:
-        candidate = (current + " " + word).strip()
-        if len(candidate) <= max_chars:
-            current = candidate
-        else:
-            if current:
-                pieces.append(current)
-            current = word
-    if current:
-        pieces.append(current)
-    return pieces
+    if len(words) > 1:
+        # Word-boundary split (Latin, etc.)
+        pieces, current = [], ""
+        for word in words:
+            candidate = (current + " " + word).strip()
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    pieces.append(current)
+                current = word
+        if current:
+            pieces.append(current)
+        return pieces
+    # No spaces (CJK) — split at character boundaries
+    return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
 
 
 def build_chunks(paragraphs: list[str], mode: str, n: int, max_chars: int = 9999) -> list[str]:
@@ -156,10 +171,11 @@ def build_chunks(paragraphs: list[str], mode: str, n: int, max_chars: int = 9999
 
     return chunks
 
-def chars_per_line_for_font(font_pt: int) -> int:
+def chars_per_line_for_font(font_pt: int, lang_code: str = "en") -> int:
     """Estimated characters that fit on one line at the given font size."""
-    usable_w_pt = (13.33 - 0.9) * 72   # ~895 pt
-    return max(10, int(usable_w_pt / (font_pt * 0.55)))
+    usable_w_pt = (13.33 - 0.9) * 72
+    factor      = _char_width_factor(lang_code)
+    return max(5, int(usable_w_pt / (font_pt * factor)))
 
 
 def fix_widow(text: str, chars_per_line: int) -> str:
@@ -196,26 +212,32 @@ def fix_widow(text: str, chars_per_line: int) -> str:
 
 def fix_orphan_chunks(chunks: list[str], max_chars: int, min_words: int = 3) -> list[str]:
     """
-    Merge any chunk that is an orphan (fewer than min_words words) into the
-    previous chunk when it fits within max_chars; otherwise redistribute words
-    evenly between the two chunks.
+    Merge any chunk that is an orphan into the previous chunk when possible.
+    For space-delimited text: orphan = fewer than min_words words.
+    For CJK (no spaces): orphan = fewer than min_words * 4 characters.
     """
     if len(chunks) <= 1:
         return chunks
 
+    def _is_orphan(text: str) -> bool:
+        if " " in text:
+            return len(text.split()) < min_words
+        return len(text) < min_words * 4   # ~3 short CJK words
+
     result = list(chunks)
     i = len(result) - 1
     while i > 0:
-        if len(result[i].split()) < min_words:
+        if _is_orphan(result[i]):
             merged = (result[i - 1] + " " + result[i]).strip()
             if len(merged) <= max_chars:
                 result[i - 1] = merged
                 result.pop(i)
             else:
-                all_words = result[i - 1].split() + result[i].split()
-                mid = len(all_words) // 2
-                result[i - 1] = " ".join(all_words[:mid])
-                result[i]     = " ".join(all_words[mid:])
+                # Redistribute evenly at the character midpoint
+                combined = result[i - 1] + result[i]
+                mid = len(combined) // 2
+                result[i - 1] = combined[:mid].rstrip()
+                result[i]     = combined[mid:].lstrip()
         i -= 1
 
     return result
@@ -269,6 +291,8 @@ def build_pptx(
     font_pt: int,
     theme_name: str,
     title: str,
+    src_lang_code: str = "en",
+    tgt_lang_code: str = "zh-CN",
 ) -> Presentation:
     palette = THEMES[theme_name]
     bg      = palette["bg"]
@@ -312,11 +336,12 @@ def build_pptx(
     div_top   = orig_top  + BOX_H + DIV_GAP
     trans_top = div_top   + DIV_H + DIV_GAP
 
-    cpl = chars_per_line_for_font(font_pt)
+    cpl_src = chars_per_line_for_font(font_pt, src_lang_code)
+    cpl_tgt = chars_per_line_for_font(font_pt, tgt_lang_code)
 
     for orig_text, trans_text in zip(chunks, translations):
-        orig_text  = fix_widow(orig_text,  cpl)
-        trans_text = fix_widow(trans_text, cpl)
+        orig_text  = fix_widow(orig_text,  cpl_src)
+        trans_text = fix_widow(trans_text, cpl_tgt)
         slide = prs.slides.add_slide(blank_layout)
         _set_bg(slide, bg)
 
@@ -408,7 +433,13 @@ if uploaded_file:
         st.info(f"{len(paragraphs)} paragraph(s) read from document.")
 
         mode_key  = "paragraph" if split_mode == "Paragraphs" else "sentence"
-        max_chars = max_chars_for_font(font_size)
+        src_code  = LANGUAGES[src_lang]
+        tgt_code  = LANGUAGES[tgt_lang]
+        # Use the stricter (smaller) limit so both languages fit without overflow
+        max_chars = min(
+            max_chars_for_font(font_size, src_code),
+            max_chars_for_font(font_size, tgt_code),
+        )
         chunks = build_chunks(paragraphs, mode_key, sentences_per_slide, max_chars)
         chunks = fix_orphan_chunks(chunks, max_chars)
         st.info(f"{len(chunks)} slide(s) will be created.")
@@ -429,6 +460,8 @@ if uploaded_file:
                 font_pt=font_size,
                 theme_name=theme,
                 title=title_text,
+                src_lang_code=src_code,
+                tgt_lang_code=tgt_code,
             )
             buf = io.BytesIO()
             prs.save(buf)
