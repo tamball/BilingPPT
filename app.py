@@ -1,9 +1,9 @@
 import io
 import re
 
+import openai
 import streamlit as st
 from docx import Document
-from deep_translator import GoogleTranslator
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
@@ -99,10 +99,24 @@ def max_chars_for_font(font_pt: int, lang_code: str = "en") -> int:
     usable_w   = (13.33 - 0.9) * 72
     factor     = _char_width_factor(lang_code)
     chars_line = int(usable_w / (font_pt * factor))
-    return max(10, int(lines * chars_line * 0.75))
+    return max(10, int(lines * chars_line * 0.90))
 
 
-def _src_max_chars(font_pt: int, src_code: str, tgt_code: str) -> int:
+def optimal_font_size(chunks: list[str], lang_code: str) -> int:
+    """
+    Return the largest font size (pt) at which the longest chunk still fits
+    within one slide-half text box.
+    """
+    if not chunks:
+        return 54
+    max_len = max(len(c) for c in chunks)
+    for f in range(80, 34, -1):
+        if max_chars_for_font(f, lang_code) >= max_len:
+            return f
+    return 35
+
+
+def _src_max_chars(orig_font_pt: int, tgt_font_pt: int, src_code: str, tgt_code: str) -> int:
     """
     Max source-text characters per slide, accounting for cross-script expansion
     so that the *translated* text also fits in its half of the slide.
@@ -110,20 +124,21 @@ def _src_max_chars(font_pt: int, src_code: str, tgt_code: str) -> int:
     CJK → Latin translations expand ~2.5×; Latin → CJK compress to ~0.4×.
     Using the inverse expansion as a divisor keeps translated text in-bounds.
     """
-    src_max = max_chars_for_font(font_pt, src_code)
-    tgt_max = max_chars_for_font(font_pt, tgt_code)
+    src_max = max_chars_for_font(orig_font_pt, src_code)
+    tgt_max = max_chars_for_font(tgt_font_pt, tgt_code)
 
     src_is_cjk = src_code in CJK_LANG_CODES
     tgt_is_cjk = tgt_code in CJK_LANG_CODES
 
     if src_is_cjk and not tgt_is_cjk:
-        # e.g. Chinese → English: translation is ~2.5× longer in characters
-        src_max = min(src_max, int(tgt_max / 2.5))
+        # e.g. Chinese → English: translation expands ~2.5×, cap src accordingly
+        return min(src_max, int(tgt_max / 2.5))
     elif not src_is_cjk and tgt_is_cjk:
-        # e.g. English → Chinese: translation is compressed; keep as-is
-        pass
-
-    return min(src_max, tgt_max)
+        # e.g. English → Chinese: translation compresses, src_max is the limit
+        return src_max
+    else:
+        # Same script family — use the smaller to be safe
+        return min(src_max, tgt_max)
 
 
 def _split_to_fit(text: str, max_chars: int) -> list[str]:
@@ -271,17 +286,31 @@ def fix_orphan_chunks(chunks: list[str], max_chars: int, min_words: int = 3) -> 
 
 def translate_chunks(
     chunks: list[str],
-    src: str,
-    tgt: str,
+    src_name: str,
+    tgt_name: str,
+    api_key: str,
     progress_bar,
 ) -> list[str]:
-    translator = GoogleTranslator(source=src, target=tgt)
+    client = openai.OpenAI(api_key=api_key)
     results = []
     total = len(chunks)
+    system_prompt = (
+        f"You are a professional translator. "
+        f"Translate the user's text from {src_name} to {tgt_name}. "
+        f"Return only the translated text, with no explanations or extra commentary."
+    )
     for idx, text in enumerate(chunks):
         try:
-            translated = translator.translate(text) or text
-        except Exception:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": text},
+                ],
+                temperature=0.2,
+            )
+            translated = response.choices[0].message.content.strip() or text
+        except Exception as e:
             translated = text  # fall back to original on any error
         results.append(translated)
         progress_bar.progress((idx + 1) / total)
@@ -320,7 +349,8 @@ def _add_textbox(slide, left, top, width, height, text, color, font_pt, bold=Fal
 def build_pptx(
     chunks: list[str],
     translations: list[str],
-    font_pt: int,
+    orig_font_pt: int,
+    trans_font_pt: int,
     theme_name: str,
     title: str,
     src_lang_code: str = "en",
@@ -348,7 +378,7 @@ def build_pptx(
             Inches(12.33), Inches(3.5),
             title,
             orig_c,
-            max(font_pt, 60),
+            max(orig_font_pt, 60),
             bold=True,
             align=PP_ALIGN.CENTER,
         )
@@ -368,8 +398,8 @@ def build_pptx(
     div_top   = orig_top  + BOX_H + DIV_GAP
     trans_top = div_top   + DIV_H + DIV_GAP
 
-    cpl_src = chars_per_line_for_font(font_pt, src_lang_code)
-    cpl_tgt = chars_per_line_for_font(font_pt, tgt_lang_code)
+    cpl_src = chars_per_line_for_font(orig_font_pt, src_lang_code)
+    cpl_tgt = chars_per_line_for_font(trans_font_pt, tgt_lang_code)
 
     for orig_text, trans_text in zip(chunks, translations):
         orig_text  = fix_widow(orig_text,  cpl_src)
@@ -380,7 +410,7 @@ def build_pptx(
         # Original text (top half)
         _add_textbox(
             slide, MARGIN, orig_top, TEXT_W, BOX_H,
-            orig_text, orig_c, font_pt,
+            orig_text, orig_c, orig_font_pt,
         )
 
         # Divider bar
@@ -395,7 +425,7 @@ def build_pptx(
         # Translated text (bottom half)
         _add_textbox(
             slide, MARGIN, trans_top, TEXT_W, BOX_H,
-            trans_text, trans_c, font_pt,
+            trans_text, trans_c, trans_font_pt,
         )
 
     return prs
@@ -416,6 +446,15 @@ st.caption(
 # ── Sidebar settings ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Settings")
+
+    openai_api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-…",
+        help="Your OpenAI API key. Never stored — used only for this session.",
+    )
+
+    st.divider()
 
     src_lang = st.selectbox(
         "Sermon language (source)",
@@ -439,7 +478,18 @@ with st.sidebar:
 
     st.divider()
 
-    font_size = st.slider("Font size (pt)", min_value=45, max_value=80, value=54)
+    font_mode = st.radio(
+        "Font size mode",
+        ["Auto (optimal)", "Manual"],
+        help="Auto picks the largest font that fits each half-slide. Manual lets you set sizes with sliders.",
+    )
+    if font_mode == "Manual":
+        orig_font_size  = st.slider(f"{src_lang} (original) font size (pt)",   min_value=28, max_value=80, value=54, key="orig_font_size")
+        trans_font_size = st.slider(f"{tgt_lang} (translated) font size (pt)", min_value=28, max_value=80, value=54, key="trans_font_size")
+    else:
+        orig_font_size  = 54  # placeholder — overridden after translation
+        trans_font_size = 54
+        st.caption("Optimal sizes will be calculated after translation.")
     theme = st.selectbox("Slide theme", list(THEMES.keys()))
     title_text = st.text_input("Presentation title (optional)")
 
@@ -467,26 +517,54 @@ if uploaded_file:
         mode_key  = "paragraph" if split_mode == "Paragraphs" else "sentence"
         src_code  = LANGUAGES[src_lang]
         tgt_code  = LANGUAGES[tgt_lang]
-        # Use cross-script-aware limit: accounts for CJK→Latin expansion (~2.5×)
-        max_chars = _src_max_chars(font_size, src_code, tgt_code)
+        # In auto mode pack text using minimum font so chunks are as dense as possible
+        pack_orig  = orig_font_size  if font_mode == "Manual" else 28
+        pack_trans = trans_font_size if font_mode == "Manual" else 28
+        max_chars = _src_max_chars(pack_orig, pack_trans, src_code, tgt_code)
         chunks = build_chunks(paragraphs, mode_key, sentences_per_slide, max_chars)
         chunks = fix_orphan_chunks(chunks, max_chars)
         st.info(f"{len(chunks)} slide(s) will be created.")
+
+        if not openai_api_key:
+            st.error("Please enter your OpenAI API key in the sidebar before generating slides.")
+            st.stop()
 
         st.write("**Translating…** (this may take a moment for long sermons)")
         progress = st.progress(0)
         translations = translate_chunks(
             chunks,
-            LANGUAGES[src_lang],
-            LANGUAGES[tgt_lang],
+            src_lang,
+            tgt_lang,
+            openai_api_key,
             progress,
         )
+
+        opt_orig  = optimal_font_size(chunks,       src_code)
+        opt_trans = optimal_font_size(translations, tgt_code)
+
+        if font_mode == "Auto (optimal)":
+            final_orig_font  = opt_orig
+            final_trans_font = opt_trans
+            st.success(
+                f"Auto font sizes — "
+                f"**{src_lang}**: {final_orig_font} pt | "
+                f"**{tgt_lang}**: {final_trans_font} pt"
+            )
+        else:
+            final_orig_font  = orig_font_size
+            final_trans_font = trans_font_size
+            st.info(
+                f"Optimal font sizes for full slide usage — "
+                f"**{src_lang}**: {opt_orig} pt | "
+                f"**{tgt_lang}**: {opt_trans} pt"
+            )
 
         with st.spinner("Building PowerPoint…"):
             prs = build_pptx(
                 chunks,
                 translations,
-                font_pt=font_size,
+                orig_font_pt=final_orig_font,
+                trans_font_pt=final_trans_font,
                 theme_name=theme,
                 title=title_text,
                 src_lang_code=src_code,
