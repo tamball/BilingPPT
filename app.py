@@ -1,8 +1,13 @@
 import io
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 
 import openai
 import streamlit as st
+from deep_translator import GoogleTranslator
 from docx import Document
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -77,10 +82,54 @@ def _char_width_factor(lang_code: str) -> float:
     """Return estimated average character width as a fraction of font size (em)."""
     return 1.0 if lang_code in CJK_LANG_CODES else 0.55
 
-def extract_paragraphs(docx_file) -> list[str]:
-    """Return non-empty paragraph strings from a .docx file."""
-    doc = Document(docx_file)
-    return [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+def _find_libreoffice() -> str | None:
+    """Return the LibreOffice executable path, or None if not found."""
+    candidates = [
+        "libreoffice",
+        "soffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    ]
+    for cmd in candidates:
+        if shutil.which(cmd) or os.path.isfile(cmd):
+            return cmd
+    return None
+
+
+def extract_paragraphs(uploaded_file) -> list[str]:
+    """Return non-empty paragraph strings from a .doc or .docx file."""
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith(".docx"):
+        doc = Document(uploaded_file)
+        return [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+
+    # ── .doc (legacy binary format) ──────────────────────────────────────────
+    lo_cmd = _find_libreoffice()
+    if lo_cmd is None:
+        raise RuntimeError(
+            "Cannot open .doc files: LibreOffice is not installed. "
+            "Please install LibreOffice (https://www.libreoffice.org) "
+            "or save your file as .docx and re-upload."
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        doc_path = os.path.join(tmpdir, "input.doc")
+        with open(doc_path, "wb") as f:
+            f.write(uploaded_file.read())
+
+        result = subprocess.run(
+            [lo_cmd, "--headless", "--convert-to", "docx", "--outdir", tmpdir, doc_path],
+            capture_output=True,
+            timeout=60,
+        )
+
+        docx_path = os.path.join(tmpdir, "input.docx")
+        if not os.path.exists(docx_path):
+            stderr = result.stderr.decode(errors="replace")
+            raise RuntimeError(f"LibreOffice conversion failed: {stderr}")
+
+        doc = Document(docx_path)
+        return [p.text.strip() for p in doc.paragraphs if p.text.strip()]
 
 
 def split_sentences(text: str) -> list[str]:
@@ -284,7 +333,7 @@ def fix_orphan_chunks(chunks: list[str], max_chars: int, min_words: int = 3) -> 
 
 # ── Translation ───────────────────────────────────────────────────────────────
 
-def translate_chunks(
+def translate_chunks_openai(
     chunks: list[str],
     src_name: str,
     tgt_name: str,
@@ -311,6 +360,26 @@ def translate_chunks(
             )
             translated = response.choices[0].message.content.strip() or text
         except Exception as e:
+            translated = text  # fall back to original on any error
+        results.append(translated)
+        progress_bar.progress((idx + 1) / total)
+    return results
+
+
+def translate_chunks_google(
+    chunks: list[str],
+    src_code: str,
+    tgt_code: str,
+    progress_bar,
+) -> list[str]:
+    """Translate using Google Translate (free, no API key required)."""
+    results = []
+    total = len(chunks)
+    # Google Translate uses 'zh-CN' / 'zh-TW'; deep-translator accepts them directly
+    for idx, text in enumerate(chunks):
+        try:
+            translated = GoogleTranslator(source=src_code, target=tgt_code).translate(text) or text
+        except Exception:
             translated = text  # fall back to original on any error
         results.append(translated)
         progress_bar.progress((idx + 1) / total)
@@ -447,12 +516,20 @@ st.caption(
 with st.sidebar:
     st.header("Settings")
 
-    openai_api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        placeholder="sk-…",
-        help="Your OpenAI API key. Never stored — used only for this session.",
+    translation_engine = st.radio(
+        "Translation engine",
+        ["Google Translate (free)", "OpenAI (API key required)"],
+        help="Google Translate is free and requires no key. OpenAI uses GPT-4o-mini for higher quality.",
     )
+
+    openai_api_key = ""
+    if translation_engine == "OpenAI (API key required)":
+        openai_api_key = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            placeholder="sk-…",
+            help="Your OpenAI API key. Never stored — used only for this session.",
+        )
 
     st.divider()
 
@@ -495,9 +572,9 @@ with st.sidebar:
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader(
-    "Upload sermon document (.docx)",
-    type=["docx"],
-    help="Microsoft Word .docx format only.",
+    "Upload sermon document (.doc / .docx)",
+    type=["doc", "docx"],
+    help="Microsoft Word .doc or .docx format. For .doc files, LibreOffice must be installed.",
 )
 
 if uploaded_file:
@@ -506,7 +583,11 @@ if uploaded_file:
     if st.button("Generate Bilingual Slides", type="primary"):
 
         with st.spinner("Reading document…"):
-            paragraphs = extract_paragraphs(uploaded_file)
+            try:
+                paragraphs = extract_paragraphs(uploaded_file)
+            except RuntimeError as e:
+                st.error(str(e))
+                st.stop()
 
         if not paragraphs:
             st.error("No text found in the document. Please check the file.")
@@ -525,19 +606,27 @@ if uploaded_file:
         chunks = fix_orphan_chunks(chunks, max_chars)
         st.info(f"{len(chunks)} slide(s) will be created.")
 
-        if not openai_api_key:
+        if translation_engine == "OpenAI (API key required)" and not openai_api_key:
             st.error("Please enter your OpenAI API key in the sidebar before generating slides.")
             st.stop()
 
         st.write("**Translating…** (this may take a moment for long sermons)")
         progress = st.progress(0)
-        translations = translate_chunks(
-            chunks,
-            src_lang,
-            tgt_lang,
-            openai_api_key,
-            progress,
-        )
+        if translation_engine == "OpenAI (API key required)":
+            translations = translate_chunks_openai(
+                chunks,
+                src_lang,
+                tgt_lang,
+                openai_api_key,
+                progress,
+            )
+        else:
+            translations = translate_chunks_google(
+                chunks,
+                src_code,
+                tgt_code,
+                progress,
+            )
 
         opt_orig  = optimal_font_size(chunks,       src_code)
         opt_trans = optimal_font_size(translations, tgt_code)
